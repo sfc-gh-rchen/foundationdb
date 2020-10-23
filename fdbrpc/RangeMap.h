@@ -189,8 +189,6 @@ public:
 
 	void insert( const Range& keys, const Val& value );
 
-	Future<Void> clearAsync() { return map.clearAsync(); }
-
 protected:
 	Map<Key,Val,pair_type,Metric> map;
 	const MetricFunc mf;
