@@ -42,15 +42,15 @@
 
 static NetworkAddressList g_currentDeliveryPeerAddress = NetworkAddressList();
 
-const UID WLTOKEN_ENDPOINT_NOT_FOUND(-1, 0);
-const UID WLTOKEN_PING_PACKET(-1, 1);
-const UID TOKEN_IGNORE_PACKET(0, 2);
+constexpr UID WLTOKEN_ENDPOINT_NOT_FOUND(-1, 0);
+constexpr UID WLTOKEN_PING_PACKET(-1, 1);
 const uint64_t TOKEN_STREAM_FLAG = 1;
-
 
 class EndpointMap : NonCopyable {
 public:
-	EndpointMap();
+	// Reserve space for this many wellKnownEndpoints
+	explicit EndpointMap(int wellKnownEndpointCount);
+	void insertWellKnown(NetworkMessageReceiver* r, const Endpoint::Token& token, TaskPriority priority);
 	void insert( NetworkMessageReceiver* r, Endpoint::Token& token, TaskPriority priority );
 	const Endpoint& insert( NetworkAddressList localAddresses, std::vector<std::pair<FlowReceiver*, TaskPriority>> const& streams );
 	NetworkMessageReceiver* get( Endpoint::Token const& token );
@@ -65,17 +65,16 @@ private:
 			uint64_t uid[2];  // priority packed into lower 32 bits; actual lower 32 bits of token are the index in data[]
 			uint32_t nextFree;
 		};
-		NetworkMessageReceiver* receiver;
+		NetworkMessageReceiver* receiver = nullptr;
 		Endpoint::Token& token() { return *(Endpoint::Token*)uid; }
 	};
+	int wellKnownEndpointCount;
 	std::vector<Entry> data;
 	uint32_t firstFree;
 };
 
-EndpointMap::EndpointMap()
- : firstFree(-1)
-{
-}
+EndpointMap::EndpointMap(int wellKnownEndpointCount)
+  : wellKnownEndpointCount(wellKnownEndpointCount), data(wellKnownEndpointCount), firstFree(-1) {}
 
 void EndpointMap::realloc() {
 	int oldSize = data.size();
@@ -86,6 +85,14 @@ void EndpointMap::realloc() {
 	}
 	data[data.size()-1].nextFree = firstFree;
 	firstFree = oldSize;
+}
+
+void EndpointMap::insertWellKnown(NetworkMessageReceiver* r, const Endpoint::Token& token, TaskPriority priority) {
+	int index = token.second();
+	ASSERT(data[index].receiver == nullptr);
+	data[index].receiver = r;
+	data[index].token() =
+	    Endpoint::Token(token.first(), (token.second() & 0xffffffff00000000LL) | static_cast<uint32_t>(priority));
 }
 
 void EndpointMap::insert( NetworkMessageReceiver* r, Endpoint::Token& token, TaskPriority priority ) {
@@ -135,6 +142,9 @@ const Endpoint& EndpointMap::insert( NetworkAddressList localAddresses, std::vec
 
 NetworkMessageReceiver* EndpointMap::get( Endpoint::Token const& token ) {
 	uint32_t index = token.second();
+	if (index < wellKnownEndpointCount && data[index].receiver == nullptr) {
+		TraceEvent(SevWarnAlways, "WellKnownEndpointNotAdded").detail("Token", token);
+	}
 	if ( index < data.size() && data[index].token().first() == token.first() && ((data[index].token().second()&0xffffffff00000000LL)|index)==token.second() )
 		return data[index].receiver;
 	return 0;
@@ -147,9 +157,13 @@ TaskPriority EndpointMap::getPriority( Endpoint::Token const& token ) {
 	return TaskPriority::UnknownEndpoint;
 }
 
-void EndpointMap::remove( Endpoint::Token const& token, NetworkMessageReceiver* r ) {
+void EndpointMap::remove(Endpoint::Token const& token, NetworkMessageReceiver* r) {
 	uint32_t index = token.second();
-	if ( index < data.size() && data[index].token().first() == token.first() && ((data[index].token().second()&0xffffffff00000000LL)|index)==token.second() && data[index].receiver == r ) {
+	if (index < wellKnownEndpointCount) {
+		data[index].receiver = nullptr;
+	} else if (index < data.size() && data[index].token().first() == token.first() &&
+	           ((data[index].token().second() & 0xffffffff00000000LL) | index) == token.second() &&
+	           data[index].receiver == r) {
 		data[index].receiver = 0;
 		data[index].nextFree = firstFree;
 		firstFree = index;
@@ -158,10 +172,7 @@ void EndpointMap::remove( Endpoint::Token const& token, NetworkMessageReceiver* 
 
 struct EndpointNotFoundReceiver final : NetworkMessageReceiver {
 	EndpointNotFoundReceiver(EndpointMap& endpoints) {
-		//endpoints[WLTOKEN_ENDPOINT_NOT_FOUND] = this;
-		Endpoint::Token e = WLTOKEN_ENDPOINT_NOT_FOUND;
-		endpoints.insert(this, e, TaskPriority::DefaultEndpoint);
-		ASSERT( e == WLTOKEN_ENDPOINT_NOT_FOUND );
+		endpoints.insertWellKnown(this, WLTOKEN_ENDPOINT_NOT_FOUND, TaskPriority::DefaultEndpoint);
 	}
 	void receive(ArenaObjectReader& reader) override {
 		// Remote machine tells us it doesn't have endpoint e
@@ -173,9 +184,7 @@ struct EndpointNotFoundReceiver final : NetworkMessageReceiver {
 
 struct PingReceiver final : NetworkMessageReceiver {
 	PingReceiver(EndpointMap& endpoints) {
-		Endpoint::Token e = WLTOKEN_PING_PACKET;
-		endpoints.insert(this, e, TaskPriority::ReadSocket);
-		ASSERT( e == WLTOKEN_PING_PACKET );
+		endpoints.insertWellKnown(this, WLTOKEN_PING_PACKET, TaskPriority::ReadSocket);
 	}
 	void receive(ArenaObjectReader& reader) override {
 		ReplyPromise<Void> reply;
@@ -186,7 +195,11 @@ struct PingReceiver final : NetworkMessageReceiver {
 
 class TransportData {
 public:
-	TransportData(uint64_t transportId);
+	TransportData(uint64_t transportId)
+	  : endpoints(/*wellKnownTokenCount*/ 11), warnAlwaysForLargePacket(true), lastIncompatibleMessage(0),
+	    transportId(transportId), numIncompatibleConnections(0) {
+		degraded = Reference<AsyncVar<bool>>( new AsyncVar<bool>(false) );
+	}
 
 	~TransportData();
 
@@ -210,15 +223,12 @@ public:
 	std::unordered_map<NetworkAddress, Reference<struct Peer>> peers;
 	std::unordered_map<NetworkAddress, std::pair<double, double>> closedPeers;
 	HealthMonitor healthMonitor;
-	std::set<NetworkAddress> orderedAddresses;
 	Reference<AsyncVar<bool>> degraded;
 	bool warnAlwaysForLargePacket;
 
-	// These declarations must be in exactly this order
 	EndpointMap endpoints;
-	EndpointNotFoundReceiver endpointNotFoundReceiver;
-	PingReceiver pingReceiver;
-	// End ordered declarations
+	EndpointNotFoundReceiver endpointNotFoundReceiver{ endpoints };
+	PingReceiver pingReceiver{ endpoints };
 
 	Int64MetricHandle bytesSent;
 	Int64MetricHandle countPacketsReceived;
@@ -235,57 +245,7 @@ public:
 	uint64_t transportId;
 
 	Future<Void> multiVersionCleanup;
-	Future<Void> pingLogger;
 };
-
-ACTOR Future<Void> pingLatencyLogger(TransportData* self) {
-	state NetworkAddress lastAddress = NetworkAddress();
-	loop {
-		if(self->orderedAddresses.size()) {
-			auto it = self->orderedAddresses.upper_bound(lastAddress);
-			if(it == self->orderedAddresses.end()) {
-				it = self->orderedAddresses.begin();
-			}
-			lastAddress = *it;
-			auto peer = self->getPeer(lastAddress);
-			if(!peer) {
-				TraceEvent(SevWarnAlways, "MissingNetworkAddress").suppressFor(10.0).detail("PeerAddr", lastAddress);
-			}
-			if(peer && peer->pingLatencies.getPopulationSize() >= 10) {
-				TraceEvent("PingLatency")
-				  .detail("PeerAddr", lastAddress)
-				  .detail("MinLatency", peer->pingLatencies.min())
-				  .detail("MaxLatency", peer->pingLatencies.max())
-				  .detail("MeanLatency", peer->pingLatencies.mean())
-				  .detail("MedianLatency", peer->pingLatencies.median())
-				  .detail("P90Latency", peer->pingLatencies.percentile(0.90))
-				  .detail("Count", peer->pingLatencies.getPopulationSize())
-				  .detail("BytesReceived", peer->bytesReceived - peer->lastLoggedBytesReceived)
-				  .detail("BytesSent", peer->bytesSent - peer->lastLoggedBytesSent);
-				peer->pingLatencies.clear();
-				peer->lastLoggedBytesReceived = peer->bytesReceived;
-				peer->lastLoggedBytesSent = peer->bytesSent;
-				wait(delay(FLOW_KNOBS->PING_LOGGING_INTERVAL));
-			} else if(it == self->orderedAddresses.begin()) {
-				wait(delay(FLOW_KNOBS->PING_LOGGING_INTERVAL));
-			}
-		} else {
-			wait(delay(FLOW_KNOBS->PING_LOGGING_INTERVAL));
-		}
-	}
-}
-
-TransportData::TransportData(uint64_t transportId)
-	  : endpointNotFoundReceiver(endpoints),
-		pingReceiver(endpoints),
-		warnAlwaysForLargePacket(true),
-		lastIncompatibleMessage(0),
-		transportId(transportId),
-		numIncompatibleConnections(0)
-{
-	degraded = Reference<AsyncVar<bool>>( new AsyncVar<bool>(false) );
-	pingLogger = pingLatencyLogger(this);
-}
 
 #define CONNECT_PACKET_V0 0x0FDB00A444020001LL
 #define CONNECT_PACKET_V0_SIZE 14
@@ -412,14 +372,10 @@ ACTOR Future<Void> connectionMonitor( Reference<Peer> peer ) {
 		FlowTransport::transport().sendUnreliable( SerializeSource<ReplyPromise<Void>>(reply), remotePingEndpoint, true );
 		state int64_t startingBytes = peer->bytesReceived;
 		state int timeouts = 0;
-		state double startTime = now();
 		loop {
 			choose {
 				when (wait( delay( FLOW_KNOBS->CONNECTION_MONITOR_TIMEOUT ) )) {
 					if(startingBytes == peer->bytesReceived) {
-						if(peer->destination.isPublic()) {
-							peer->pingLatencies.addSample(now() - startTime);
-						}
 						TraceEvent("ConnectionTimeout").suppressFor(1.0).detail("WithAddr", peer->destination);
 						throw connection_failed();
 					}
@@ -433,9 +389,6 @@ ACTOR Future<Void> connectionMonitor( Reference<Peer> peer ) {
 					timeouts++;
 				}
 				when (wait( reply.getFuture() )) {
-					if(peer->destination.isPublic()) {
-						peer->pingLatencies.addSample(now() - startTime);
-					}
 					break;
 				}
 				when (wait( peer->resetPing.onTrigger())) {
@@ -458,9 +411,9 @@ ACTOR Future<Void> connectionWriter( Reference<Peer> self, Reference<IConnection
 		loop {
 			lastWriteTime = now();
 
-			int sent = conn->write(self->unsent.getUnsent(), /* limit= */ FLOW_KNOBS->MAX_PACKET_SEND_BYTES);
-			if (sent) {
-				self->bytesSent += sent;
+			int sent = conn->write(self->unsent.getUnsent(), FLOW_KNOBS->MAX_PACKET_SEND_BYTES);
+
+			if (sent != 0) {
 				self->transport->bytesSent += sent;
 				self->unsent.sent(sent);
 			}
@@ -707,7 +660,6 @@ ACTOR Future<Void> connectionKeeper( Reference<Peer> self,
 				TraceEvent("PeerDestroy").error(e).suppressFor(1.0).detail("PeerAddr", self->destination);
 				self->connect.cancel();
 				self->transport->peers.erase(self->destination);
-				self->transport->orderedAddresses.erase(self->destination);
 				return Void();
 			}
 		}
@@ -717,9 +669,8 @@ ACTOR Future<Void> connectionKeeper( Reference<Peer> self,
 Peer::Peer(TransportData* transport, NetworkAddress const& destination)
   : transport(transport), destination(destination), outgoingConnectionIdle(true), lastConnectTime(0.0),
     reconnectionDelay(FLOW_KNOBS->INITIAL_RECONNECTION_TIME), compatible(true), outstandingReplies(0),
-    incompatibleProtocolVersionNewer(false), peerReferences(-1), bytesReceived(0), lastDataPacketSentTime(now()),
-    pingLatencies(destination.isPublic() ? FLOW_KNOBS->PING_SAMPLE_AMOUNT : 1), lastLoggedBytesReceived(0),
-    bytesSent(0), lastLoggedBytesSent(0) {
+    incompatibleProtocolVersionNewer(false), peerReferences(-1), bytesReceived(0), lastDataPacketSentTime(now()) {
+
 	IFailureMonitor::failureMonitor().setStatus(destination, FailureStatus(false));
 }
 
@@ -809,6 +760,15 @@ TransportData::~TransportData() {
 	}
 }
 
+static bool checkCompatible(const PeerCompatibilityPolicy& policy, ProtocolVersion version) {
+	switch (policy.requirement) {
+	case RequirePeer::Exactly:
+		return version.version() == policy.version.version();
+	case RequirePeer::AtLeast:
+		return version.version() >= policy.version.version();
+	}
+}
+
 ACTOR static void deliver(TransportData* self, Endpoint destination, ArenaReader reader, bool inReadSocket) {
 	TaskPriority priority = self->endpoints.getPriority(destination.token);
 	if (priority < TaskPriority::ReadSocket || !inReadSocket) {
@@ -819,6 +779,10 @@ ACTOR static void deliver(TransportData* self, Endpoint destination, ArenaReader
 
 	auto receiver = self->endpoints.get(destination.token);
 	if (receiver) {
+		if (!checkCompatible(receiver->peerCompatibilityPolicy(), reader.protocolVersion())) {
+			// TODO(anoyes): Report incompatibility somehow
+			return;
+		}
 		try {
 			g_currentDeliveryPeerAddress = destination.addresses;
 			StringRef data = reader.arenaReadAll();
@@ -919,7 +883,9 @@ static void scanPackets(TransportData* transport, uint8_t*& unprocessed_begin, c
 #if VALGRIND
 		VALGRIND_CHECK_MEM_IS_DEFINED(p, packetLen);
 #endif
-		ArenaReader reader(arena, StringRef(p, packetLen), AssumeVersion(currentProtocolVersion));
+		// remove object serializer flag to account for flat buffer
+		peerProtocolVersion.removeObjectSerializerFlag();
+		ArenaReader reader(arena, StringRef(p, packetLen), AssumeVersion(peerProtocolVersion));
 		UID token;
 		reader >> token;
 
@@ -1030,7 +996,8 @@ ACTOR static Future<Void> connectionReader(
 
 						uint64_t connectionId = pkt.connectionId;
 						if (!pkt.protocolVersion.hasObjectSerializerFlag() ||
-						    !pkt.protocolVersion.isCompatible(currentProtocolVersion)) {
+						    // !pkt.protocolVersion.hasStableInterfaces()) {
+							!pkt.protocolVersion.isCompatible(currentProtocolVersion)) {
 							incompatibleProtocolVersionNewer = pkt.protocolVersion > currentProtocolVersion;
 							NetworkAddress addr = pkt.canonicalRemotePort
 							                          ? NetworkAddress(pkt.canonicalRemoteIp(), pkt.canonicalRemotePort)
@@ -1043,7 +1010,6 @@ ACTOR static Future<Void> connectionReader(
 									    .detail("Reason", "IncompatibleProtocolVersion")
 									    .detail("LocalVersion", currentProtocolVersion.version())
 									    .detail("RejectedVersion", pkt.protocolVersion.version())
-									    .detail("VersionMask", ProtocolVersion::compatibleProtocolVersionMask)
 									    .detail("Peer", pkt.canonicalRemotePort ? NetworkAddress(pkt.canonicalRemoteIp(), pkt.canonicalRemotePort)
 									                                            : conn->getPeerAddress())
 									    .detail("ConnectionId", connectionId);
@@ -1107,7 +1073,7 @@ ACTOR static Future<Void> connectionReader(
 						}
 					}
 				}
-				if (compatible) {
+				if (compatible || peerProtocolVersion.hasStableInterfaces()) { // if compatible or peerProtocolVersion.hasStableInterfaces
 					scanPackets( transport, unprocessed_begin, unprocessed_end, arena, peerAddress, peerProtocolVersion );
 				}
 				else if(!expectConnectPacket) {
@@ -1197,9 +1163,6 @@ Reference<Peer> TransportData::getOrOpenPeer( NetworkAddress const& address, boo
 			peer->connect = connectionKeeper(peer);
 		}
 		peers[address] = peer;
-		if(address.isPublic()) {
-			orderedAddresses.insert(address);
-		}
 	}
 
 	return peer;
@@ -1338,10 +1301,8 @@ void FlowTransport::removeEndpoint( const Endpoint& endpoint, NetworkMessageRece
 
 void FlowTransport::addWellKnownEndpoint( Endpoint& endpoint, NetworkMessageReceiver* receiver, TaskPriority taskID ) {
 	endpoint.addresses = self->localAddresses;
-	ASSERT( ((endpoint.token.first() & TOKEN_STREAM_FLAG)!=0) == receiver->isStream() );
-	Endpoint::Token otoken = endpoint.token;
-	self->endpoints.insert( receiver, endpoint.token, taskID );
-	ASSERT( endpoint.token == otoken );
+	ASSERT(receiver->isStream());
+	self->endpoints.insertWellKnown(receiver, endpoint.token, taskID);
 }
 
 static void sendLocal( TransportData* self, ISerializeSource const& what, const Endpoint& destination ) {
