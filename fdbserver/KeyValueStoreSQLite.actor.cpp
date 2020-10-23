@@ -1451,8 +1451,9 @@ public:
 	Future<Void> getError() override { return delayed(readThreads->getError() || writeThread->getError()); }
 	Future<Void> onClosed() override { return stopped.getFuture(); }
 
-	virtual KeyValueStoreType getType() const override { return type; }
-	virtual StorageBytes getStorageBytes() const override;
+	KeyValueStoreType getType() const override { return type; }
+	StorageBytes getStorageBytes() const override;
+	bool canPipelineCommits() const override { return false; }
 
 	void set(KeyValueRef keyValue, const Arena* arena = nullptr) override;
 	void clear(KeyRangeRef range, const Arena* arena = nullptr) override;

@@ -11,14 +11,13 @@ docker-compose up -d
 ```
 
 This will start:
-
-* 1 coordinator
-* 2 fdbservers
-* 1 Flask application
+* 1 coordinator,
+* 2 fdbservers,
+* 1 Flask application.
 
 The Flask application can be accessed using curl:
 
-```bash
+```sh
 # retrieve counter
 curl http://0.0.0.0:5000/counter # 0
 
@@ -29,6 +28,7 @@ curl -X POST http://0.0.0.0:5000/counter/increment # 2
 # retrieve counter
 curl http://0.0.0.0:5000/counter # 2
 ```
+
 
 ## Access the FoundationDB cluster
 
@@ -41,7 +41,7 @@ FDB_CLUSTER_FILE=./docker.cluster fdbcli
 
 ## Stop the Python demo
 
-```bash
+```
 docker-compose down
 ```
 

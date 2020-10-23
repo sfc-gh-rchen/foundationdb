@@ -28,11 +28,15 @@
 using std::min;
 using std::max;
 
-bool DDEnabledState::isDDEnabled() const {
+// in-memory flag to disable DD
+bool ddEnabled = true;
+UID ddEnabledStatusUID = UID();
+
+bool isDDEnabled() {
 	return ddEnabled;
 }
 
-bool DDEnabledState::setDDEnabled(bool status, UID snapUID) {
+bool setDDEnabled(bool status, UID snapUID) {
 	TraceEvent("SetDDEnabled")
 		.detail("Status", status)
 		.detail("SnapUID", snapUID);
@@ -93,9 +97,8 @@ ACTOR Future<MoveKeysLock> takeMoveKeysLock( Database cx, UID ddId ) {
 	}
 }
 
-ACTOR static Future<Void> checkMoveKeysLock(Transaction* tr, MoveKeysLock lock, const DDEnabledState* ddEnabledState,
-                                            bool isWrite = true) {
-	if (!ddEnabledState->isDDEnabled()) {
+ACTOR Future<Void> checkMoveKeysLock( Transaction* tr, MoveKeysLock lock, bool isWrite = true ) {
+	if (!isDDEnabled()) {
 		TraceEvent(SevDebug, "DDDisabledByInMemoryCheck");
 		throw movekeys_conflict();
 	}
@@ -144,8 +147,8 @@ ACTOR static Future<Void> checkMoveKeysLock(Transaction* tr, MoveKeysLock lock, 
 	}
 }
 
-Future<Void> checkMoveKeysLockReadOnly(Transaction* tr, MoveKeysLock lock, const DDEnabledState* ddEnabledState) {
-	return checkMoveKeysLock(tr, lock, ddEnabledState, false);
+Future<Void> checkMoveKeysLockReadOnly( Transaction* tr, MoveKeysLock lock ) {
+	return checkMoveKeysLock(tr, lock, false);
 }
 
 ACTOR Future<Optional<UID>> checkReadWrite(Future<ErrorOr<GetShardStateReply>> fReply, UID uid, Version version) {
@@ -282,9 +285,7 @@ ACTOR Future<Void> logWarningAfter( const char * context, double duration, vecto
 // Set keyServers[keys].dest = servers
 // Set serverKeys[servers][keys] = active for each subrange of keys that the server did not already have, complete for each subrange that it already has
 // Set serverKeys[dest][keys] = "" for the dest servers of each existing shard in keys (unless that destination is a member of servers OR if the source list is sufficiently degraded)
-ACTOR static Future<Void> startMoveKeys(Database occ, KeyRange keys, vector<UID> servers, MoveKeysLock lock,
-                                        FlowLock* startMoveKeysLock, UID relocationIntervalId,
-                                        const DDEnabledState* ddEnabledState) {
+ACTOR Future<Void> startMoveKeys( Database occ, KeyRange keys, vector<UID> servers, MoveKeysLock lock, FlowLock *startMoveKeysLock, UID relocationIntervalId ) {
 	state TraceInterval interval("RelocateShard_StartMoveKeys");
 	state Future<Void> warningLogger = logWarningAfter("StartMoveKeysTooLong", 600, servers);
 	//state TraceInterval waitInterval("");
@@ -323,7 +324,7 @@ ACTOR static Future<Void> startMoveKeys(Database occ, KeyRange keys, vector<UID>
 					tr.info.taskID = TaskPriority::MoveKeys;
 					tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
 
-					wait(checkMoveKeysLock(&tr, lock, ddEnabledState));
+					wait( checkMoveKeysLock(&tr, lock) );
 
 					vector< Future< Optional<Value> > > serverListEntries;
 					for(int s=0; s<servers.size(); s++)
@@ -523,9 +524,8 @@ ACTOR Future<Void> checkFetchingState( Database cx, vector<UID> dest, KeyRange k
 // keyServers[k].dest must be the same for all k in keys
 // Set serverKeys[dest][keys] = true; serverKeys[src][keys] = false for all src not in dest
 // Should be cancelled and restarted if keyServers[keys].dest changes (?so this is no longer true?)
-ACTOR static Future<Void> finishMoveKeys(Database occ, KeyRange keys, vector<UID> destinationTeam, MoveKeysLock lock,
-                                         FlowLock* finishMoveKeysParallelismLock, bool hasRemote,
-                                         UID relocationIntervalId, const DDEnabledState* ddEnabledState) {
+ACTOR Future<Void> finishMoveKeys( Database occ, KeyRange keys, vector<UID> destinationTeam, MoveKeysLock lock, FlowLock *finishMoveKeysParallelismLock, bool hasRemote, UID relocationIntervalId )
+{
 	state TraceInterval interval("RelocateShard_FinishMoveKeys");
 	state TraceInterval waitInterval("");
 	state Future<Void> warningLogger = logWarningAfter("FinishMoveKeysTooLong", 600, destinationTeam);
@@ -556,7 +556,7 @@ ACTOR static Future<Void> finishMoveKeys(Database occ, KeyRange keys, vector<UID
 					wait( finishMoveKeysParallelismLock->take( TaskPriority::DataDistributionLaunch ) );
 					releaser = FlowLock::Releaser( *finishMoveKeysParallelismLock );
 
-					wait(checkMoveKeysLock(&tr, lock, ddEnabledState));
+					wait( checkMoveKeysLock(&tr, lock) );
 
 					state KeyRange currentKeys = KeyRangeRef(begin, keys.end);
 					state Standalone<RangeResultRef> UIDtoTagMap = wait( tr.getRange(serverTagKeys, CLIENT_KNOBS->TOO_MANY) );
@@ -893,15 +893,15 @@ ACTOR Future<bool> canRemoveStorageServer( Transaction* tr, UID serverID ) {
 	return keys[0].value == serverKeysFalse && keys[1].key == allKeys.end;
 }
 
-ACTOR Future<Void> removeStorageServer(Database cx, UID serverID, MoveKeysLock lock,
-                                       const DDEnabledState* ddEnabledState) {
+ACTOR Future<Void> removeStorageServer( Database cx, UID serverID, MoveKeysLock lock )
+{
 	state Transaction tr( cx );
 	state bool retry = false;
 	state int noCanRemoveCount = 0;
 	loop {
 		try {
 			tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
-			wait(checkMoveKeysLock(&tr, lock, ddEnabledState));
+			wait( checkMoveKeysLock(&tr, lock) );
 			TraceEvent("RemoveStorageServerLocked").detail("ServerID", serverID).detail("Version", tr.getReadVersion().get());
 
 			state bool canRemove = wait( canRemoveStorageServer( &tr, serverID ) );
@@ -978,8 +978,7 @@ ACTOR Future<Void> removeStorageServer(Database cx, UID serverID, MoveKeysLock l
 }
 // Remove the server from keyServer list and set serverKeysFalse to the server's serverKeys list.
 // Changes to keyServer and serverKey must happen symmetrically in a transaction.
-ACTOR Future<Void> removeKeysFromFailedServer(Database cx, UID serverID, MoveKeysLock lock,
-                                              const DDEnabledState* ddEnabledState) {
+ACTOR Future<Void> removeKeysFromFailedServer(Database cx, UID serverID, MoveKeysLock lock) {
 	state Key begin = allKeys.begin;
 	// Multi-transactional removal in case of large number of shards, concern in violating 5s transaction limit
 	while (begin < allKeys.end) {
@@ -988,7 +987,7 @@ ACTOR Future<Void> removeKeysFromFailedServer(Database cx, UID serverID, MoveKey
 			try {
 				tr.info.taskID = TaskPriority::MoveKeys;
 				tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
-				wait(checkMoveKeysLock(&tr, lock, ddEnabledState));
+				wait(checkMoveKeysLock(&tr, lock));
 				TraceEvent("RemoveKeysFromFailedServerLocked")
 				    .detail("ServerID", serverID)
 				    .detail("Version", tr.getReadVersion().get())
@@ -1047,19 +1046,25 @@ ACTOR Future<Void> removeKeysFromFailedServer(Database cx, UID serverID, MoveKey
 	return Void();
 }
 
-ACTOR Future<Void> moveKeys(Database cx, KeyRange keys, vector<UID> destinationTeam, vector<UID> healthyDestinations,
-                            MoveKeysLock lock, Promise<Void> dataMovementComplete,
-                            FlowLock* startMoveKeysParallelismLock, FlowLock* finishMoveKeysParallelismLock,
-                            bool hasRemote, UID relocationIntervalId, const DDEnabledState* ddEnabledState) {
+ACTOR Future<Void> moveKeys(
+	Database cx,
+	KeyRange keys,
+	vector<UID> destinationTeam,
+	vector<UID> healthyDestinations,
+	MoveKeysLock lock,
+	Promise<Void> dataMovementComplete,
+	FlowLock *startMoveKeysParallelismLock,
+	FlowLock *finishMoveKeysParallelismLock,
+	bool hasRemote,
+	UID relocationIntervalId)
+{
 	ASSERT( destinationTeam.size() );
 	std::sort( destinationTeam.begin(), destinationTeam.end() );
-	wait(startMoveKeys(cx, keys, destinationTeam, lock, startMoveKeysParallelismLock, relocationIntervalId,
-	                   ddEnabledState));
+	wait( startMoveKeys( cx, keys, destinationTeam, lock, startMoveKeysParallelismLock, relocationIntervalId ) );
 
 	state Future<Void> completionSignaller = checkFetchingState( cx, healthyDestinations, keys, dataMovementComplete, relocationIntervalId );
 
-	wait(finishMoveKeys(cx, keys, destinationTeam, lock, finishMoveKeysParallelismLock, hasRemote, relocationIntervalId,
-	                    ddEnabledState));
+	wait( finishMoveKeys( cx, keys, destinationTeam, lock, finishMoveKeysParallelismLock, hasRemote, relocationIntervalId ) );
 
 	//This is defensive, but make sure that we always say that the movement is complete before moveKeys completes
 	completionSignaller.cancel();
