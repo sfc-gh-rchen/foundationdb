@@ -20,10 +20,6 @@
 
 #ifndef FLOW_TRANSPORT_H
 #define FLOW_TRANSPORT_H
-#include "flow/ProtocolVersion.h"
-#include "flow/serialize.h"
-#include <cstdint>
-#include <memory>
 #pragma once
 
 #include <algorithm>
@@ -31,6 +27,7 @@
 #include "flow/genericactors.actor.h"
 #include "flow/network.h"
 #include "flow/FileIdentifier.h"
+#include "flow/ProtocolVersion.h"
 #include "flow/Net2Packet.h"
 #include "fdbrpc/ContinuousSample.h"
 
@@ -161,6 +158,7 @@ struct Peer : public ReferenceCounted<Peer> {
 	ContinuousSample<double> pingLatencies;
 	int64_t lastLoggedBytesReceived;
 	int64_t lastLoggedBytesSent;
+	Reference<AsyncVar<Optional<ProtocolVersion>>> protocolVersion;
 
 	explicit Peer(TransportData* transport, NetworkAddress const& destination);
 
@@ -240,6 +238,8 @@ public:
 
 	bool incompatibleOutgoingConnectionsPresent();
 
+	Reference<AsyncVar<Optional<ProtocolVersion>>> getPeerProtocolAsyncVar(NetworkAddress addr);
+
 	static FlowTransport& transport() { return *static_cast<FlowTransport*>((void*) g_network->global(INetwork::enFlowTransport)); }
 	static NetworkAddress getGlobalLocalAddress() { return transport().getLocalAddress(); }
 	static NetworkAddressList getGlobalLocalAddresses() { return transport().getLocalAddresses(); }
@@ -256,7 +256,5 @@ inline bool Endpoint::isLocal() const {
 	const auto& localAddrs = FlowTransport::transport().getLocalAddresses();
 	return addresses.address == localAddrs.address || (localAddrs.secondaryAddress.present() && addresses.address == localAddrs.secondaryAddress.get());
 }
-
-const int PACKET_LEN_WIDTH = sizeof(uint32_t);
 
 #endif

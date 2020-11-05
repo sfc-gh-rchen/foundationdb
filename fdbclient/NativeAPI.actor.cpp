@@ -30,6 +30,7 @@
 
 #include "fdbclient/FDBTypes.h"
 #include "fdbrpc/FailureMonitor.h"
+#include "fdbrpc/FlowTransport.h"
 #include "fdbrpc/MultiInterface.h"
 
 #include "fdbclient/Atomic.h"
@@ -56,6 +57,7 @@
 #include "flow/DeterministicRandom.h"
 #include "flow/Error.h"
 #include "flow/IRandom.h"
+#include "flow/ProtocolVersion.h"
 #include "flow/flow.h"
 #include "flow/genericactors.actor.h"
 #include "flow/Knobs.h"
@@ -577,13 +579,6 @@ ACTOR Future<Void> updateCachedRanges(DatabaseContext* self, std::map<UID, Stora
 							containedRangesBegin = ranges.begin().range().begin;
 						}
 						for (auto iter = ranges.begin(); iter != ranges.end(); ++iter) {
-							// We probably don't want to do the code below? Otherwise we would never
-							// fetch the corresponding storages - which would give us a different semantics
-							//if (containedRangesEnd > iter->range().begin) {
-							//	self->locationCache.insert(
-							//	    KeyRangeRef{ containedRangesEnd, iter->range().begin },
-							//	    Reference<LocationInfo>{ new LocationInfo{ cacheInterfaces, true } });
-							//}
 							containedRangesEnd = iter->range().end;
 							if (iter->value() && !iter->value()->hasCaches) {
 								iter->value() = addCaches(iter->value(), cacheInterfaces);
@@ -592,7 +587,8 @@ ACTOR Future<Void> updateCachedRanges(DatabaseContext* self, std::map<UID, Stora
 						auto iter = self->locationCache.rangeContaining(begin);
 						if (iter->value() && !iter->value()->hasCaches) {
 							if (end>=iter->range().end) {
-								self->locationCache.insert(KeyRangeRef{ begin, iter->range().end },
+								Key endCopy = iter->range().end; // Copy because insertion invalidates iterator
+								self->locationCache.insert(KeyRangeRef{ begin, endCopy },
 														   addCaches(iter->value(), cacheInterfaces));
 							} else {
 								self->locationCache.insert(KeyRangeRef{ begin, end },
@@ -601,7 +597,8 @@ ACTOR Future<Void> updateCachedRanges(DatabaseContext* self, std::map<UID, Stora
 						}
 						iter = self->locationCache.rangeContainingKeyBefore(end);
 						if (iter->value() && !iter->value()->hasCaches) {
-							self->locationCache.insert(KeyRangeRef{iter->range().begin, end}, addCaches(iter->value(), cacheInterfaces));
+							Key beginCopy = iter->range().begin; // Copy because insertion invalidates iterator
+							self->locationCache.insert(KeyRangeRef{beginCopy, end}, addCaches(iter->value(), cacheInterfaces));
 						}
 					}
 				}
@@ -934,7 +931,7 @@ DatabaseContext::DatabaseContext(Reference<AsyncVar<Reference<ClusterConnectionF
 		registerSpecialKeySpaceModule(
 		    SpecialKeySpace::MODULE::MANAGEMENT, SpecialKeySpace::IMPLTYPE::READONLY,
 		    std::make_unique<ExclusionInProgressRangeImpl>(
-		        KeyRangeRef(LiteralStringRef("inProgressExclusion/"), LiteralStringRef("inProgressExclusion0"))
+		        KeyRangeRef(LiteralStringRef("in_progress_exclusion/"), LiteralStringRef("in_progress_exclusion0"))
 				.withPrefix(SpecialKeySpace::getModuleRange(SpecialKeySpace::MODULE::MANAGEMENT).begin)));
 		registerSpecialKeySpaceModule(
 		    SpecialKeySpace::MODULE::CONFIGURATION, SpecialKeySpace::IMPLTYPE::READWRITE,
@@ -948,8 +945,13 @@ DatabaseContext::DatabaseContext(Reference<AsyncVar<Reference<ClusterConnectionF
 		            .withPrefix(SpecialKeySpace::getModuleRange(SpecialKeySpace::MODULE::CONFIGURATION).begin)));
 		registerSpecialKeySpaceModule(
 			SpecialKeySpace::MODULE::MANAGEMENT, SpecialKeySpace::IMPLTYPE::READWRITE,
-			std::make_unique<LockDatabaseImpl>(singleKeyRange(LiteralStringRef("dbLocked"))
+			std::make_unique<LockDatabaseImpl>(singleKeyRange(LiteralStringRef("db_locked"))
 					.withPrefix(SpecialKeySpace::getModuleRange(SpecialKeySpace::MODULE::MANAGEMENT).begin)));
+		registerSpecialKeySpaceModule(
+		    SpecialKeySpace::MODULE::MANAGEMENT, SpecialKeySpace::IMPLTYPE::READWRITE,
+		    std::make_unique<ConsistencyCheckImpl>(
+		        singleKeyRange(LiteralStringRef("consistency_check_suspended"))
+		            .withPrefix(SpecialKeySpace::getModuleRange(SpecialKeySpace::MODULE::MANAGEMENT).begin)));
 	}
 	if (apiVersionAtLeast(630)) {
 		registerSpecialKeySpaceModule(SpecialKeySpace::MODULE::TRANSACTION, SpecialKeySpace::IMPLTYPE::READONLY,
@@ -4170,24 +4172,49 @@ Future<Standalone<StringRef>> Transaction::getVersionstamp() {
 	return versionstampPromise.getFuture();
 }
 
-ACTOR Future<ProtocolVersion> coordinatorProtocolsFetcher(Reference<ClusterConnectionFile> f) {
-	state ClientCoordinators coord(f);
+ACTOR Future<Void> getConnectPktVersions(vector<Reference<AsyncVar<Optional<ProtocolVersion>>>> peerProtocolAsyncVars) {
+	state int targetQuorumSize = peerProtocolAsyncVars.size()/2 + 1;
+	state int majorityProtocolCount = 0;
 
-	state vector<Future<ProtocolInfoReply>> coordProtocols;
-	coordProtocols.reserve(coord.clientLeaderServers.size());
-	for (int i = 0; i < coord.clientLeaderServers.size(); i++) {
-		RequestStream<ProtocolInfoRequest> requestStream{ Endpoint{
-			{ coord.clientLeaderServers[i].getLeader.getEndpoint().addresses }, WLTOKEN_PROTOCOL_INFO } };
-		coordProtocols.push_back(retryBrokenPromise(requestStream, ProtocolInfoRequest{}));
+	while(majorityProtocolCount < peerProtocolAsyncVars.size()/2 + 1) {
+		state vector<Future<Void>> peerProtocolVersionFutures;
+		peerProtocolVersionFutures.reserve(peerProtocolAsyncVars.size());
+
+		for(int i = 0; i<peerProtocolAsyncVars.size(); i++) {
+			peerProtocolVersionFutures.push_back(peerProtocolAsyncVars[i]->get().present() ? Void() : peerProtocolAsyncVars[i]->onChange());
+		}
+
+		wait(smartQuorum(peerProtocolVersionFutures, targetQuorumSize, 1.5));
+		std::unordered_map<uint64_t, int> protocolCount;
+
+		for(int i = 0; i<peerProtocolVersionFutures.size(); i++) {
+			if(peerProtocolVersionFutures[i].isReady()) {
+				protocolCount[peerProtocolAsyncVars[i]->get().get().version()]++;
+			}
+		}
+		
+		majorityProtocolCount = std::max_element(protocolCount.begin(), protocolCount.end(), [](const std::pair<uint64_t, int>& l, const std::pair<uint64_t, int>& r){
+			return l.second < r.second;
+		})->second;
+
+		if(targetQuorumSize < peerProtocolAsyncVars.size()) {
+			targetQuorumSize++;
+		}
 	}
 
-	wait(smartQuorum(coordProtocols, coordProtocols.size() / 2 + 1, 1.5));
+	return Void();
+}
 
+ProtocolVersion testGetMajorityProtocolVersionFromAsyncVars(vector<Reference<AsyncVar<Optional<ProtocolVersion>>>>& peerProtocolAsyncVars) {
 	std::unordered_map<uint64_t, int> protocolCount;
-	for(int i = 0; i<coordProtocols.size(); i++) {
-		if(coordProtocols[i].isReady()) {
-			protocolCount[coordProtocols[i].get().version.version()]++;
+	for (int i = 0; i < peerProtocolAsyncVars.size(); i++) {
+		if(peerProtocolAsyncVars[i]->get().present()) {
+			protocolCount[peerProtocolAsyncVars[i]->get().get().version()]++;
 		}
+	}
+
+	if(protocolCount.empty()) {
+		return ProtocolVersion(0);
 	}
 
 	uint64_t majorityProtocol = std::max_element(protocolCount.begin(), protocolCount.end(), [](const std::pair<uint64_t, int>& l, const std::pair<uint64_t, int>& r){
@@ -4196,8 +4223,147 @@ ACTOR Future<ProtocolVersion> coordinatorProtocolsFetcher(Reference<ClusterConne
 	return ProtocolVersion(majorityProtocol);
 }
 
+ACTOR Future<Void> testSetProtocolVersionAsyncVarAfterTimeout(Reference<AsyncVar<Optional<ProtocolVersion>>> peerProtocolAsyncVar, ProtocolVersion version, int delayTime) {
+	wait(delay(delayTime));
+	peerProtocolAsyncVar->set(version);
+	return Void();
+}
+
+TEST_CASE("/fdbclient/protocol_version/get_all_current") {
+	state ProtocolVersion protocolVersion = ProtocolVersion(0x0FDB00B070010001LL);
+	Reference<AsyncVar<Optional<ProtocolVersion>>> first = Reference<AsyncVar<Optional<ProtocolVersion>>>(new AsyncVar<Optional<ProtocolVersion>>(protocolVersion));
+	Reference<AsyncVar<Optional<ProtocolVersion>>> second = Reference<AsyncVar<Optional<ProtocolVersion>>>(new AsyncVar<Optional<ProtocolVersion>>(protocolVersion));
+	Reference<AsyncVar<Optional<ProtocolVersion>>> third = Reference<AsyncVar<Optional<ProtocolVersion>>>(new AsyncVar<Optional<ProtocolVersion>>(protocolVersion));
+
+	state std::vector<Reference<AsyncVar<Optional<ProtocolVersion>>>> peerProtocolAsyncVars = {first, second, third};
+
+	wait(getConnectPktVersions(peerProtocolAsyncVars));
+
+	ASSERT(testGetMajorityProtocolVersionFromAsyncVars(peerProtocolAsyncVars) == protocolVersion);
+	return Void();
+}
+
+TEST_CASE("/fdbclient/protocol_version/get_one_diff") {
+	state ProtocolVersion protocolVersion = ProtocolVersion(0x0FDB00B070010001LL);
+	state ProtocolVersion otherProtocolVersion = ProtocolVersion(0x0FDB00B070010000LL);
+
+	Reference<AsyncVar<Optional<ProtocolVersion>>> first = Reference<AsyncVar<Optional<ProtocolVersion>>>(new AsyncVar<Optional<ProtocolVersion>>(otherProtocolVersion));
+	Reference<AsyncVar<Optional<ProtocolVersion>>> second = Reference<AsyncVar<Optional<ProtocolVersion>>>(new AsyncVar<Optional<ProtocolVersion>>(protocolVersion));
+	Reference<AsyncVar<Optional<ProtocolVersion>>> third = Reference<AsyncVar<Optional<ProtocolVersion>>>(new AsyncVar<Optional<ProtocolVersion>>(protocolVersion));
+
+	state std::vector<Reference<AsyncVar<Optional<ProtocolVersion>>>> peerProtocolAsyncVars = {first, second, third};
+
+	wait(getConnectPktVersions(peerProtocolAsyncVars));
+
+	ASSERT(testGetMajorityProtocolVersionFromAsyncVars(peerProtocolAsyncVars) == protocolVersion);
+	return Void();
+}
+
+TEST_CASE("/fdbclient/protocol_version/wait_for_majority_one_empty") {
+	state ProtocolVersion protocolVersion = ProtocolVersion(0x0FDB00B070010001LL);
+	Reference<AsyncVar<Optional<ProtocolVersion>>> first = Reference<AsyncVar<Optional<ProtocolVersion>>>(new AsyncVar<Optional<ProtocolVersion>>());
+	Reference<AsyncVar<Optional<ProtocolVersion>>> second = Reference<AsyncVar<Optional<ProtocolVersion>>>(new AsyncVar<Optional<ProtocolVersion>>());
+	Reference<AsyncVar<Optional<ProtocolVersion>>> third = Reference<AsyncVar<Optional<ProtocolVersion>>>(new AsyncVar<Optional<ProtocolVersion>>(protocolVersion));
+
+	state std::vector<Reference<AsyncVar<Optional<ProtocolVersion>>>> peerProtocolAsyncVars = {first, second, third};
+
+	std::vector<Future<Void>> futures = {getConnectPktVersions(peerProtocolAsyncVars), testSetProtocolVersionAsyncVarAfterTimeout(first, protocolVersion, 1)};
+	wait(waitForAll(futures));
+
+	ASSERT(testGetMajorityProtocolVersionFromAsyncVars(peerProtocolAsyncVars) == protocolVersion);
+	return Void();
+}
+
+TEST_CASE("/fdbclient/protocol_version/wait_one") {
+	state ProtocolVersion protocolVersion = ProtocolVersion(0x0FDB00B070010001LL);
+	Reference<AsyncVar<Optional<ProtocolVersion>>> first = Reference<AsyncVar<Optional<ProtocolVersion>>>(new AsyncVar<Optional<ProtocolVersion>>());
+
+	state std::vector<Reference<AsyncVar<Optional<ProtocolVersion>>>> peerProtocolAsyncVars = {first};
+
+	std::vector<Future<Void>> futures = {getConnectPktVersions(peerProtocolAsyncVars), testSetProtocolVersionAsyncVarAfterTimeout(first, protocolVersion, 1)};
+	wait(waitForAll(futures));
+
+	ASSERT(testGetMajorityProtocolVersionFromAsyncVars(peerProtocolAsyncVars) == protocolVersion);
+	return Void();
+}
+
+TEST_CASE("/fdbclient/protocol_version/wait_for_majority") {
+	state ProtocolVersion protocolVersion = ProtocolVersion(0x0FDB00B070010001LL);
+	state ProtocolVersion otherProtocolVersion = ProtocolVersion(0x0FDB00B070010000LL);
+
+	Reference<AsyncVar<Optional<ProtocolVersion>>> first = Reference<AsyncVar<Optional<ProtocolVersion>>>(new AsyncVar<Optional<ProtocolVersion>>());
+	Reference<AsyncVar<Optional<ProtocolVersion>>> second = Reference<AsyncVar<Optional<ProtocolVersion>>>(new AsyncVar<Optional<ProtocolVersion>>(otherProtocolVersion));
+	Reference<AsyncVar<Optional<ProtocolVersion>>> third = Reference<AsyncVar<Optional<ProtocolVersion>>>(new AsyncVar<Optional<ProtocolVersion>>(protocolVersion));
+
+	state std::vector<Reference<AsyncVar<Optional<ProtocolVersion>>>> peerProtocolAsyncVars = {first, second, third};
+
+	std::vector<Future<Void>> futures = {getConnectPktVersions(peerProtocolAsyncVars), testSetProtocolVersionAsyncVarAfterTimeout(first, protocolVersion, 1)};
+	wait(waitForAll(futures));
+
+	ASSERT(testGetMajorityProtocolVersionFromAsyncVars(peerProtocolAsyncVars) == protocolVersion);
+	return Void();
+}
+
+TEST_CASE("/fdbclient/protocol_version/wait_for_majority_one_diff") {
+	state ProtocolVersion protocolVersion = ProtocolVersion(0x0FDB00B070010001LL);
+	state ProtocolVersion otherProtocolVersion = ProtocolVersion(0x0FDB00B070010000LL);
+
+	Reference<AsyncVar<Optional<ProtocolVersion>>> first = Reference<AsyncVar<Optional<ProtocolVersion>>>(new AsyncVar<Optional<ProtocolVersion>>());
+	Reference<AsyncVar<Optional<ProtocolVersion>>> second = Reference<AsyncVar<Optional<ProtocolVersion>>>(new AsyncVar<Optional<ProtocolVersion>>());
+	Reference<AsyncVar<Optional<ProtocolVersion>>> third = Reference<AsyncVar<Optional<ProtocolVersion>>>(new AsyncVar<Optional<ProtocolVersion>>());
+
+	state std::vector<Reference<AsyncVar<Optional<ProtocolVersion>>>> peerProtocolAsyncVars = {first, second, third};
+
+	std::vector<Future<Void>> futures = {
+		getConnectPktVersions(peerProtocolAsyncVars),
+		testSetProtocolVersionAsyncVarAfterTimeout(first, protocolVersion, 1),
+		testSetProtocolVersionAsyncVarAfterTimeout(second, otherProtocolVersion, 1),
+		testSetProtocolVersionAsyncVarAfterTimeout(third, protocolVersion, 2)
+	};
+	wait(waitForAll(futures));
+
+	ASSERT(testGetMajorityProtocolVersionFromAsyncVars(peerProtocolAsyncVars) == protocolVersion);
+	return Void();
+}
+
+ACTOR Future<ProtocolVersion> coordinatorProtocolsFetcher(Reference<ClusterConnectionFile> f) {
+	state ClientCoordinators coord(f);
+
+	state vector<Future<ProtocolInfoReply>> coordProtocols;
+	state vector<Reference<AsyncVar<Optional<ProtocolVersion>>>> peerProtocolAsyncVars;
+	coordProtocols.reserve(coord.clientLeaderServers.size());
+	peerProtocolAsyncVars.reserve(coord.clientLeaderServers.size());
+
+	for (int i = 0; i < coord.clientLeaderServers.size(); i++) {
+		RequestStream<ProtocolInfoRequest> requestStream{ Endpoint{
+			{ coord.clientLeaderServers[i].getLeader.getEndpoint().addresses }, WLTOKEN_PROTOCOL_INFO } };
+		coordProtocols.push_back(retryBrokenPromise(requestStream, ProtocolInfoRequest{}));
+
+		Reference<AsyncVar<Optional<ProtocolVersion>>> protocolOptionalAsyncVar = FlowTransport::transport().getPeerProtocolAsyncVar(coord.clientLeaderServers[i].getLeader.getEndpoint().getPrimaryAddress());
+		peerProtocolAsyncVars.push_back(protocolOptionalAsyncVar);
+	}
+
+	wait(smartQuorum(coordProtocols, coordProtocols.size() / 2 + 1, 1.5) || getConnectPktVersions(peerProtocolAsyncVars));
+
+	std::unordered_map<uint64_t, int> protocolCount;
+	for (int i = 0; i < coord.clientLeaderServers.size(); i++) {
+		if(coordProtocols[i].isReady()) {
+			protocolCount[coordProtocols[i].get().version.version()]++;
+		}
+		else if(peerProtocolAsyncVars[i]->get().present()) {
+			protocolCount[peerProtocolAsyncVars[i]->get().get().version()]++;
+		}
+	}
+
+	ASSERT(!protocolCount.empty());
+
+	uint64_t majorityProtocol = std::max_element(protocolCount.begin(), protocolCount.end(), [](const std::pair<uint64_t, int>& l, const std::pair<uint64_t, int>& r){
+		return l.second < r.second;
+	})->first;
+	return ProtocolVersion(majorityProtocol);
+}
+
 ACTOR Future<uint64_t> getCoordinatorProtocols(Reference<ClusterConnectionFile> f) {
-	// TODO: let client know if server is present but before this feature is introduced
 	ProtocolVersion protocolVersion = wait(coordinatorProtocolsFetcher(f));
 	return protocolVersion.version();
 }
