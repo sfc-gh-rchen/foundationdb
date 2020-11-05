@@ -159,6 +159,7 @@ struct Peer : public ReferenceCounted<Peer> {
 	int64_t lastLoggedBytesReceived;
 	int64_t lastLoggedBytesSent;
 	Reference<AsyncVar<Optional<ProtocolVersion>>> protocolVersion;
+	bool receivedConnectPacket;
 
 	explicit Peer(TransportData* transport, NetworkAddress const& destination);
 

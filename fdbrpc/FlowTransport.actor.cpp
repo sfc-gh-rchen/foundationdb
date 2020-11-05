@@ -51,6 +51,15 @@ constexpr UID WLTOKEN_PING_PACKET(-1, 1);
 constexpr int PACKET_LEN_WIDTH = sizeof(uint32_t);
 const uint64_t TOKEN_STREAM_FLAG = 1;
 
+std::string hexifyChecksumBuffer(char* buffer, int width) {
+	std::stringstream stream;	
+	stream << std::hex;	
+	for(int i = 0; i<width; i++){	
+		stream << (int)buffer[i];	
+	}	
+	return stream.str();
+}
+
 struct IChecksum {
 public:
 	// Width in number of bytes
@@ -775,6 +784,7 @@ ACTOR Future<Void> connectionKeeper( Reference<Peer> self,
 				conn->close();
 				conn = Reference<IConnection>();
 				self->protocolVersion->set(Optional<ProtocolVersion>());
+				self->receivedConnectPacket = false;
 			}
 
 			// Clients might send more packets in response, which needs to go out on the next connection
@@ -799,7 +809,8 @@ Peer::Peer(TransportData* transport, NetworkAddress const& destination)
     reconnectionDelay(FLOW_KNOBS->INITIAL_RECONNECTION_TIME), compatible(true), outstandingReplies(0),
     incompatibleProtocolVersionNewer(false), peerReferences(-1), bytesReceived(0), lastDataPacketSentTime(now()),
     pingLatencies(destination.isPublic() ? FLOW_KNOBS->PING_SAMPLE_AMOUNT : 1), lastLoggedBytesReceived(0),
-    bytesSent(0), lastLoggedBytesSent(0), protocolVersion(Reference<AsyncVar<Optional<ProtocolVersion>>>(new AsyncVar<Optional<ProtocolVersion>>())) {
+    bytesSent(0), lastLoggedBytesSent(0), protocolVersion(Reference<AsyncVar<Optional<ProtocolVersion>>>(new AsyncVar<Optional<ProtocolVersion>>())),
+	receivedConnectPacket(false) {
 	IFailureMonitor::failureMonitor().setStatus(destination, FailureStatus(false));
 }
 
@@ -942,6 +953,7 @@ ACTOR static void deliver(TransportData* self, Endpoint destination, ArenaReader
 		g_network->setCurrentTask( TaskPriority::ReadSocket );
 }
 
+// TODO: we could take out peerProtocolVersion as a parameter and instead access it through transport data and peerAddress
 static void scanPackets(TransportData* transport, uint8_t*& unprocessed_begin, const uint8_t* e, Arena& arena,
                         NetworkAddress const& peerAddress, ProtocolVersion peerProtocolVersion) {
 	// Find each complete packet in the given byte range and queue a ready task to deliver it.
@@ -953,10 +965,12 @@ static void scanPackets(TransportData* transport, uint8_t*& unprocessed_begin, c
 	loop {
 		// Retrieve packet len and checksum
 		uint32_t packetLen;	
-		IChecksum* checksum = getMinChecksum(std::min(g_network->protocolVersion(), peerProtocolVersion));	
-		int checksumWidth = checksumEnabled ? checksum->width() : 0;	
-		if(e-p < sizeof(packetLen) + checksumWidth) break;	
-			
+
+		bool& peerReceivedConnectPacket = transport->peers[peerAddress]->receivedConnectPacket;
+		IChecksum* checksum = getMinChecksum(std::min(g_network->protocolVersion(), peerReceivedConnectPacket ? peerProtocolVersion : ProtocolVersion(0)));
+		int checksumWidth = checksumEnabled ? checksum->width() : 0;
+		if(e-p < sizeof(packetLen) + checksumWidth) break;
+
 		packetLen = *(uint32_t*)p; p += PACKET_LEN_WIDTH;
 
 		if (packetLen > FLOW_KNOBS->PACKET_LIMIT) {
@@ -970,6 +984,7 @@ static void scanPackets(TransportData* transport, uint8_t*& unprocessed_begin, c
 		if (checksumEnabled) {
 			char* checksumStart = (char*)p;	
 			p += checksum->width();
+
 			bool isBuggifyEnabled = false;
 			if(g_network->isSimulated() && g_network->now() - g_simulator.lastConnectionFailure > g_simulator.connectionFailuresDisableDuration && BUGGIFY_WITH_PROB(0.0001)) {
 				g_simulator.lastConnectionFailure = g_network->now();
@@ -994,29 +1009,42 @@ static void scanPackets(TransportData* transport, uint8_t*& unprocessed_begin, c
 			char* checksumBuffer = (char*) alloca(checksum->width());	
 			checksum->append(std::string_view((char*)p, packetLen));	
 			checksum->writeSum(checksumBuffer);	
-			// store stringified checksums in hex for trace	
-			std::stringstream packetStream;	
-			std::stringstream calculatedStream;	
-			packetStream << std::hex;	
-			calculatedStream << std::hex;	
-			for(int i = 0; i<checksum->width(); i++){	
-				packetStream << (int)checksumStart[i];	
-				calculatedStream << (int)checksumBuffer[i];	
-			}	
-			std::string packetChecksum = packetStream.str();	
-			std::string calculatedChecksum = calculatedStream.str();
 
-			if (memcmp(checksumBuffer, checksumStart, checksum->width()) != 0) {
+			// store stringified checksums in hex for trace	
+			std::string packetChecksum = hexifyChecksumBuffer(checksumStart, checksum->width());
+			std::string calculatedChecksum =  hexifyChecksumBuffer(checksumBuffer, checksum->width());
+			
+			bool checksumMatch = memcmp(checksumBuffer, checksumStart, checksum->width()) == 0;
+
+			// if the checksum doesn't match and we don't yet know if peer received connect packet, try updating checksum
+			if(!checksumMatch && !peerReceivedConnectPacket) {
+				IChecksum* updatedChecksum = getMinChecksum(std::min(g_network->protocolVersion(), peerProtocolVersion));
+				char* updatedChecksumBuffer = (char*) alloca(updatedChecksum->width());	
+				updatedChecksum->append(std::string_view((char*)p, packetLen));	
+				updatedChecksum->writeSum(updatedChecksumBuffer);
+
+				// if updated checksum algorithm matches
+				if(memcmp(updatedChecksumBuffer, checksumStart, updatedChecksum->width()) == 0) {
+					// TODO: until we add another checksum version, peerReceivedConnectPacket will always be false, which could be misleading
+					checksumMatch = true;
+					peerReceivedConnectPacket = true;
+					packetChecksum = hexifyChecksumBuffer(checksumStart, updatedChecksum->width());
+					calculatedChecksum = hexifyChecksumBuffer(updatedChecksumBuffer, updatedChecksum->width());
+				}
+			}
+
+			if(!checksumMatch) {
 				if (isBuggifyEnabled) {	
 					TraceEvent(SevInfo, "ChecksumMismatchExp").detail("PacketChecksum", packetChecksum).detail("CalculatedChecksum", calculatedChecksum);	
 				} else {	
 					TraceEvent(SevWarnAlways, "ChecksumMismatchUnexp").detail("PacketChecksum", packetChecksum).detail("CalculatedChecksum", calculatedChecksum);	
 				}	
-				throw checksum_failed();	
-			} else {	
+				throw checksum_failed();
+			}
+			else {
 				if (isBuggifyEnabled) {	
 					TraceEvent(SevError, "ChecksumMatchUnexp").detail("PacketChecksum", packetChecksum).detail("CalculatedChecksum", calculatedChecksum);	
-				}	
+				}
 			}
 		}
 
@@ -1218,7 +1246,7 @@ ACTOR static Future<Void> connectionReader(
 				}
 
 				if (compatible || peerProtocolVersion.hasStableInterfaces()) {
-					scanPackets( transport, unprocessed_begin, unprocessed_end, arena, peerAddress, peerProtocolVersion );
+					scanPackets( transport, unprocessed_begin, unprocessed_end, arena, peerAddress, peerProtocolVersion);
 				}
 				else if(!expectConnectPacket) {
 					unprocessed_begin = unprocessed_end;
@@ -1490,8 +1518,10 @@ static ReliablePacket* sendPacket(TransportData* self, Reference<Peer> peer, ISe
 
 	// Reserve some space for packet length and checksum, write them after serializing data
 	SplitBuffer packetInfoBuffer;
-	// TODO: This is incorrect. We need to make sure that we send message with checksum that the receiver can understand
-	IChecksum* checksum = getMinChecksum(g_network->protocolVersion());
+
+	Optional<ProtocolVersion> protocolOptional = peer->protocolVersion->get();
+	IChecksum* checksum = protocolOptional.present() ? getMinChecksum(std::min(g_network->protocolVersion(), protocolOptional.get())) : protocolToChecksum.begin()->second.get();
+
 	uint32_t len;
 	int packetInfoSize = PACKET_LEN_WIDTH;
 	if (checksumEnabled) {
