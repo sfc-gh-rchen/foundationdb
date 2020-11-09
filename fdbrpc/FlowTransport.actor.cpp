@@ -22,8 +22,6 @@
 #include "fdbrpc/FlowTransport.h"
 #include "flow/network.h"
 
-#include <cstdint>
-#include <unordered_map>
 #if VALGRIND
 #include <memcheck.h>
 #endif
@@ -95,30 +93,67 @@ private:
 	int checksumWidth;
 };
 
-static const std::map<ProtocolVersion, std::unique_ptr<IChecksum>> protocolToChecksum = []() {
-	std::map<ProtocolVersion, std::unique_ptr<IChecksum>> m;
-	m[ProtocolVersion(0)] = std::make_unique<CRC32>(CRC32());
-	return m;
-}();
+static const std::map<ProtocolVersion, std::shared_ptr<IChecksum>> protocolToChecksum = {
+	{ ProtocolVersion(0), std::make_shared<CRC32>(CRC32()) }
+};
 
-IChecksum* getMinChecksum(ProtocolVersion protocol) {
+std::shared_ptr<IChecksum> getMinChecksum(ProtocolVersion protocol) {
 	ASSERT(protocol >= protocolToChecksum.begin()->first);
 
 	// returns an iterator to the first pair in protocolToChecksum with key strictly greater than protocol
 	auto protocolChecksumIter = protocolToChecksum.upper_bound(protocol);
 	--protocolChecksumIter;
 
-	return protocolChecksumIter->second.get();
+	return protocolChecksumIter->second;
+}
+
+struct BuggifiedCRC32 : IChecksum {
+public:
+	BuggifiedCRC32() {
+		checksum = uint32_t(0);
+		checksumWidth = sizeof(checksum) - 1;
+	}
+	int width() const override {
+		return checksumWidth;
+	}
+	void append(std::string_view bytes) override {
+		checksum = crc32c_append(checksum, (uint8_t*)bytes.data(), bytes.size());
+	}
+	void writeSum(char* buffer) override {
+		std::memcpy(buffer, &checksum, checksumWidth);
+		reset();
+	}
+private:
+	void reset() {
+		checksum = 0;
+	}
+
+	uint32_t checksum;
+	int checksumWidth;
+};
+
+static const std::map<ProtocolVersion, std::shared_ptr<IChecksum>> protocolToBuggifiedChecksum = {
+	{ ProtocolVersion(0), std::make_shared<BuggifiedCRC32>(BuggifiedCRC32()) }
+};
+
+std::shared_ptr<IChecksum> getMinBuggifiedChecksum(ProtocolVersion protocol) {
+	ASSERT(protocol >= protocolToBuggifiedChecksum.begin()->first);
+
+	// returns an iterator to the first pair in protocolToBuggifiedChecksum with key strictly greater than protocol
+	auto protocolChecksumIter = protocolToBuggifiedChecksum.upper_bound(protocol);
+	--protocolChecksumIter;
+
+	return protocolChecksumIter->second;
 }
 
 TEST_CASE("fdbrpc/ChecksumAlgorithm/GetAlgorithm") {
 	const ProtocolVersion IMPLEMENTED_PROTOCOL_VERSION = ProtocolVersion(0x0FDB00B070010001LL);
 
-	IChecksum* resOne = getMinChecksum(ProtocolVersion(0));
-	ASSERT(resOne == protocolToChecksum.at(ProtocolVersion(0)).get());
+	std::shared_ptr<IChecksum> resOne = getMinChecksum(ProtocolVersion(0));
+	ASSERT(resOne == protocolToChecksum.at(ProtocolVersion(0)));
 
-	IChecksum* resTwo = getMinChecksum(IMPLEMENTED_PROTOCOL_VERSION);
-	ASSERT(resTwo == protocolToChecksum.at(ProtocolVersion(0)).get());
+	std::shared_ptr<IChecksum> resTwo = getMinChecksum(IMPLEMENTED_PROTOCOL_VERSION);
+	ASSERT(resTwo == protocolToChecksum.at(ProtocolVersion(0)));
 	return Void();
 }
 
@@ -963,15 +998,20 @@ static void scanPackets(TransportData* transport, uint8_t*& unprocessed_begin, c
 
 	const bool checksumEnabled = !peerAddress.isTLS();
 	loop {
-		// Retrieve packet len and checksum
-		uint32_t packetLen;	
-
 		bool& peerReceivedConnectPacket = transport->peers[peerAddress]->receivedConnectPacket;
-		IChecksum* checksum = getMinChecksum(std::min(g_network->protocolVersion(), peerReceivedConnectPacket ? peerProtocolVersion : ProtocolVersion(0)));
-		int checksumWidth = checksumEnabled ? checksum->width() : 0;
-		if(e-p < sizeof(packetLen) + checksumWidth) break;
+		std::shared_ptr<IChecksum> checksum = getMinChecksum(std::min(g_network->protocolVersion(), peerReceivedConnectPacket ? peerProtocolVersion : ProtocolVersion(0)));
 
-		packetLen = *(uint32_t*)p; p += PACKET_LEN_WIDTH;
+		bool useBuggifiedChecksumWidth = false;
+		if(g_network->isSimulated() && g_network->now() - g_simulator.lastConnectionFailure > g_simulator.connectionFailuresDisableDuration && BUGGIFY_WITH_PROB(0.5)) {
+			checksum = getMinBuggifiedChecksum(std::min(g_network->protocolVersion(), peerReceivedConnectPacket ? peerProtocolVersion : ProtocolVersion(0)));
+			g_simulator.lastConnectionFailure = g_network->now();
+			useBuggifiedChecksumWidth = true;
+		}
+
+		int checksumWidth = checksumEnabled ? checksum->width() : 0;
+		if(e-p < PACKET_LEN_WIDTH + checksumWidth) break;
+
+		uint32_t packetLen = *(uint32_t*)p; p += PACKET_LEN_WIDTH;
 
 		if (packetLen > FLOW_KNOBS->PACKET_LIMIT) {
 			TraceEvent(SevError, "PacketLimitExceeded").detail("FromPeer", peerAddress.toString()).detail("Length", (int)packetLen);
@@ -985,10 +1025,10 @@ static void scanPackets(TransportData* transport, uint8_t*& unprocessed_begin, c
 			char* checksumStart = (char*)p;	
 			p += checksum->width();
 
-			bool isBuggifyEnabled = false;
-			if(g_network->isSimulated() && g_network->now() - g_simulator.lastConnectionFailure > g_simulator.connectionFailuresDisableDuration && BUGGIFY_WITH_PROB(0.0001)) {
+			bool useBuggifiedCheckum = false;
+			if(!useBuggifiedChecksumWidth && g_network->isSimulated() && g_network->now() - g_simulator.lastConnectionFailure > g_simulator.connectionFailuresDisableDuration && BUGGIFY_WITH_PROB(0.0001)) {
 				g_simulator.lastConnectionFailure = g_network->now();
-				isBuggifyEnabled = true;
+				useBuggifiedCheckum = true;
 				TraceEvent(SevInfo, "BitsFlip");
 				int flipBits = 32 - (int) floor(log2(deterministicRandom()->randomUInt32()));
 
@@ -1015,10 +1055,12 @@ static void scanPackets(TransportData* transport, uint8_t*& unprocessed_begin, c
 			std::string calculatedChecksum =  hexifyChecksumBuffer(checksumBuffer, checksum->width());
 			
 			bool checksumMatch = memcmp(checksumBuffer, checksumStart, checksum->width()) == 0;
-
 			// if the checksum doesn't match and we don't yet know if peer received connect packet, try updating checksum
 			if(!checksumMatch && !peerReceivedConnectPacket) {
-				IChecksum* updatedChecksum = getMinChecksum(std::min(g_network->protocolVersion(), peerProtocolVersion));
+				std::shared_ptr<IChecksum> updatedChecksum = getMinChecksum(std::min(g_network->protocolVersion(), peerProtocolVersion));
+				if(useBuggifiedChecksumWidth) {
+					updatedChecksum =  getMinBuggifiedChecksum(std::min(g_network->protocolVersion(), peerProtocolVersion));
+				}
 				char* updatedChecksumBuffer = (char*) alloca(updatedChecksum->width());	
 				updatedChecksum->append(std::string_view((char*)p, packetLen));	
 				updatedChecksum->writeSum(updatedChecksumBuffer);
@@ -1034,7 +1076,7 @@ static void scanPackets(TransportData* transport, uint8_t*& unprocessed_begin, c
 			}
 
 			if(!checksumMatch) {
-				if (isBuggifyEnabled) {	
+				if (useBuggifiedCheckum || useBuggifiedChecksumWidth) {	
 					TraceEvent(SevInfo, "ChecksumMismatchExp").detail("PacketChecksum", packetChecksum).detail("CalculatedChecksum", calculatedChecksum);	
 				} else {	
 					TraceEvent(SevWarnAlways, "ChecksumMismatchUnexp").detail("PacketChecksum", packetChecksum).detail("CalculatedChecksum", calculatedChecksum);	
@@ -1042,7 +1084,7 @@ static void scanPackets(TransportData* transport, uint8_t*& unprocessed_begin, c
 				throw checksum_failed();
 			}
 			else {
-				if (isBuggifyEnabled) {	
+				if (useBuggifiedCheckum || useBuggifiedChecksumWidth) {	
 					TraceEvent(SevError, "ChecksumMatchUnexp").detail("PacketChecksum", packetChecksum).detail("CalculatedChecksum", calculatedChecksum);	
 				}
 			}
@@ -1520,7 +1562,7 @@ static ReliablePacket* sendPacket(TransportData* self, Reference<Peer> peer, ISe
 	SplitBuffer packetInfoBuffer;
 
 	Optional<ProtocolVersion> protocolOptional = peer->protocolVersion->get();
-	IChecksum* checksum = protocolOptional.present() ? getMinChecksum(std::min(g_network->protocolVersion(), protocolOptional.get())) : protocolToChecksum.begin()->second.get();
+	std::shared_ptr<IChecksum> checksum = protocolOptional.present() ? getMinChecksum(std::min(g_network->protocolVersion(), protocolOptional.get())) : protocolToChecksum.begin()->second;
 
 	uint32_t len;
 	int packetInfoSize = PACKET_LEN_WIDTH;
